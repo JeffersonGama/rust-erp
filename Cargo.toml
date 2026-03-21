@@ -1,0 +1,31 @@
+[package]
+name = "erp-agent"
+version = "0.1.0"
+edition = "2021"
+authors = ["Dev Solo <sysadmin@empresa.com>"]
+
+[dependencies]
+# Core & Async Runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI & Config
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+
+# Web Server (Daemon) & Client (Central)
+axum = "0.7"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Serialização
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Manipulação de Estado e I/O
+rust-ini = "0.21"
+fs3 = "0.5"
+sha2 = "0.10"
+
+# Observabilidade Segura
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
