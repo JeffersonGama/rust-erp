@@ -1,0 +1,2 @@
+dbaccess_path = "/totvs/bin/dbaccess"
+dbaccessini_path = "/totvs/config/dbaccess.ini"
