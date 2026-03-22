@@ -7,7 +7,8 @@ use ini::Ini;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::daemon::security::{secure_join, PathSecurityError};
+use crate::config::AppConfig;
+use crate::daemon::security::{sanitize_relative_path, secure_join, PathSecurityError};
 
 #[derive(Debug, Deserialize)]
 pub struct PatchIniRequest {
@@ -32,6 +33,7 @@ pub enum IniPatchError {
     Io(std::io::Error),
     Parse(ini::Error),
     MissingSection(String),
+    InvalidConfiguredPath(PathSecurityError),
 }
 
 impl From<std::io::Error> for IniPatchError {
@@ -46,24 +48,40 @@ impl From<ini::Error> for IniPatchError {
     }
 }
 
-pub fn patch_ini_file(
-    base_path: &Path,
+pub fn patch_dbaccess_ini_file(
+    config: &AppConfig,
     request: &PatchIniRequest,
 ) -> Result<PatchIniResult, IniPatchError> {
-    let target_path =
-        secure_join(base_path, &request.target_file).map_err(IniPatchError::InvalidPath)?;
+    let target_path = configured_dbaccess_ini_path(config)?;
+    patch_ini_at_path(&target_path, request)
+}
 
+fn configured_dbaccess_ini_path(config: &AppConfig) -> Result<PathBuf, IniPatchError> {
+    let configured_path = &config.dbaccessini_path;
+
+    if configured_path.is_absolute() {
+        return Ok(configured_path.clone());
+    }
+
+    sanitize_relative_path(configured_path.to_string_lossy().as_ref())
+        .map_err(IniPatchError::InvalidConfiguredPath)
+}
+
+fn patch_ini_at_path(
+    target_path: &Path,
+    request: &PatchIniRequest,
+) -> Result<PatchIniResult, IniPatchError> {
     if !target_path.is_file() {
-        return Err(IniPatchError::FileNotFound(target_path));
+        return Err(IniPatchError::FileNotFound(target_path.to_path_buf()));
     }
 
     let mut file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&target_path)?;
+        .open(target_path)?;
     file.lock_exclusive()?;
 
-    let patch_result = patch_locked_file(&mut file, &target_path, request);
+    let patch_result = patch_locked_file(&mut file, target_path, request);
     let unlock_result = file.unlock();
 
     match (patch_result, unlock_result) {
@@ -72,6 +90,15 @@ pub fn patch_ini_file(
         (Ok(_), Err(err)) => Err(IniPatchError::Io(err)),
         (Err(original_err), Err(_unlock_err)) => Err(original_err),
     }
+}
+
+pub fn patch_ini_file(
+    base_path: &Path,
+    request: &PatchIniRequest,
+) -> Result<PatchIniResult, IniPatchError> {
+    let target_path =
+        secure_join(base_path, &request.target_file).map_err(IniPatchError::InvalidPath)?;
+    patch_ini_at_path(&target_path, request)
 }
 
 fn patch_locked_file(
@@ -189,5 +216,60 @@ mod tests {
         assert!(result.changed);
         assert!(after.contains("Thread=40"));
         assert!(after.contains("Password=encrypted"));
+    }
+
+    #[test]
+    fn patch_uses_dbaccess_ini_path_from_config() {
+        let base = temp_dir();
+        let ini_path = base.join("custom/dbaccess.ini");
+        fs::create_dir_all(ini_path.parent().unwrap()).unwrap();
+        fs::write(
+            &ini_path,
+            "[Postgres]
+Thread=10
+Password=encrypted
+",
+        )
+        .unwrap();
+
+        let config = AppConfig {
+            dbaccess_path: base.join("bin/dbaccess"),
+            dbaccessini_path: ini_path.clone(),
+        };
+
+        let request = PatchIniRequest {
+            target_file: "ignored-by-config.ini".into(),
+            section: "Postgres".into(),
+            key: "Thread".into(),
+            new_value: "40".into(),
+        };
+
+        let result = patch_dbaccess_ini_file(&config, &request).unwrap();
+        let after = fs::read_to_string(&ini_path).unwrap();
+
+        assert!(result.changed);
+        assert_eq!(result.path, ini_path);
+        assert!(after.contains("Thread=40"));
+    }
+
+    #[test]
+    fn patch_rejects_invalid_relative_path_from_config() {
+        let config = AppConfig {
+            dbaccess_path: PathBuf::from("/totvs/bin/dbaccess"),
+            dbaccessini_path: PathBuf::from("../dbaccess.ini"),
+        };
+
+        let request = PatchIniRequest {
+            target_file: "dbaccess.ini".into(),
+            section: "Postgres".into(),
+            key: "Thread".into(),
+            new_value: "40".into(),
+        };
+
+        let err = patch_dbaccess_ini_file(&config, &request).unwrap_err();
+        assert!(matches!(
+            err,
+            IniPatchError::InvalidConfiguredPath(PathSecurityError::ParentTraversalForbidden)
+        ));
     }
 }
