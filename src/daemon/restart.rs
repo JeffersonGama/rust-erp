@@ -1,22 +1,59 @@
+//! Restart de serviços via `systemctl`.
+//!
+//! A única função pública, [`restart_service`], aplica três filtros
+//! encadeados antes de executar qualquer binário externo:
+//!
+//! 1. **Formato** — o `service_id` precisa casar com o regex
+//!    [`SERVICE_ID_PATTERN`] (só `[A-Za-z0-9_-]`). Bloqueia
+//!    tentativas triviais de command injection (`svc; rm -rf /`).
+//! 2. **Allowlist** — o ID precisa estar em `daemon.allowed_services`
+//!    da config. É a política central: qualquer serviço que o
+//!    daemon pode reiniciar é uma decisão explícita do operador.
+//! 3. **Timeout** — 30 segundos no `systemctl restart`; se estourar,
+//!    a operação falha como `Timeout` em vez de ficar pendurada.
+//!
+//! # Assumptions
+//!
+//! - O processo tem permissão para rodar `systemctl restart` nos
+//!   serviços da allowlist. Em Protheus isso normalmente significa
+//!   rodar como root, via sudoers ou via polkit. Não há fallback.
+
 use std::time::Duration;
 
 use serde::Deserialize;
 use tokio::process::Command;
 
-/// Regex para validar service IDs: apenas alfanuméricos, hífens e underscores.
+/// Regex para validar `service_id`: só aceita alfanuméricos, hífen
+/// e underscore. É o primeiro anel de defesa contra command
+/// injection; a allowlist é o segundo.
 const SERVICE_ID_PATTERN: &str = r"^[a-zA-Z0-9_-]+$";
 
+/// Payload JSON aceito por `POST /api/v1/restart`.
 #[derive(Debug, Deserialize)]
 pub struct RestartRequest {
+    /// ID do serviço a reiniciar (ex: `totvs-appserver`).
     pub service_id: String,
 }
 
+/// Falhas possíveis em [`restart_service`].
+///
+/// No handler HTTP cada variante vira um status diferente:
+/// `InvalidServiceId`→400, `ServiceNotAllowed`→403, `Timeout`→504,
+/// `CommandFailed`/`Io`→500.
 #[derive(Debug)]
 pub enum RestartError {
+    /// `service_id` válido em formato, mas ausente da allowlist.
     ServiceNotAllowed(String),
+    /// `service_id` não bate com [`SERVICE_ID_PATTERN`] — a request
+    /// é rejeitada antes de chegar ao `systemctl`.
     InvalidServiceId(String),
+    /// `systemctl` rodou mas retornou código de erro. Inclui stderr
+    /// para auditoria.
     CommandFailed { code: Option<i32>, stderr: String },
+    /// `systemctl restart` excedeu 30 segundos.
     Timeout,
+    /// Falha ao spawnar o `systemctl` (binário ausente, sem
+    /// permissão para `fork`/`exec`, etc).
     Io(std::io::Error),
 }
 
@@ -40,13 +77,31 @@ impl From<std::io::Error> for RestartError {
     }
 }
 
-/// Reinicia um serviço via `systemctl restart`, com:
+/// Reinicia um serviço via `systemctl restart`.
 ///
-/// - Validação de format do service_id (regex estrita).
-/// - Whitelist: só aceita IDs presentes em `allowed_services`.
-/// - Timeout de 30s para evitar hang.
+/// Fluxo:
 ///
-/// Segue RF03 e AC02 da tech-spec.
+/// 1. Valida o formato de `service_id` contra [`SERVICE_ID_PATTERN`].
+/// 2. Verifica que `service_id` está em `allowed_services`.
+/// 3. Spawna `systemctl restart <service_id>` via [`tokio::process`]
+///    e aguarda com timeout de 30s.
+/// 4. Interpreta o `ExitStatus`: sucesso devolve `stdout`,
+///    falha devolve [`RestartError::CommandFailed`] com stderr.
+///
+/// A output value retornada em caso de sucesso é o `stdout` capturado
+/// (normalmente vazio — `systemctl restart` silencioso quando OK).
+///
+/// Implementa RF03 e AC02 da tech-spec.
+///
+/// # Errors
+///
+/// - [`RestartError::InvalidServiceId`] se o regex de formato falhar.
+/// - [`RestartError::ServiceNotAllowed`] se o ID não estiver na
+///   allowlist (mesmo que bem-formado).
+/// - [`RestartError::Timeout`] se o `systemctl` não retornar em 30s.
+/// - [`RestartError::CommandFailed`] se o `systemctl` sair com
+///   código diferente de zero.
+/// - [`RestartError::Io`] se o spawn do processo falhar.
 pub async fn restart_service(
     service_id: &str,
     allowed_services: &[String],
