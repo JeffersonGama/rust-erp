@@ -1,3 +1,13 @@
+//! Upload atômico: tmp → SHA-256 → rename.
+//!
+//! Uma única função pública — [`atomic_upload`] — implementa o RF01
+//! da tech-spec: receber bytes da rede, gravar num arquivo temporário
+//! separado do destino, validar o conteúdo contra um checksum
+//! fornecido pelo cliente e só então mover para o local definitivo
+//! via `fs::rename`. O destino nunca enxerga um arquivo parcial ou
+//! corrompido: o `rename` é atômico no POSIX desde que tmp e destino
+//! vivam no mesmo filesystem.
+
 use std::path::{Path, PathBuf};
 
 use axum::body::Bytes;
@@ -7,11 +17,24 @@ use tokio::io::AsyncWriteExt;
 
 use crate::daemon::security::{secure_join, PathSecurityError};
 
+/// Falhas possíveis durante um upload atômico.
+///
+/// `InvalidPath` e `ChecksumMismatch` indicam problema na request
+/// (cliente vira 400). `Io` e `TmpDirMissing` são erros
+/// infraestruturais (viram 500 no handler).
 #[derive(Debug)]
 pub enum UploadError {
+    /// `target_relative` violou as regras de [`secure_join`]
+    /// (traversal, path absoluto, prefixo, etc).
     InvalidPath(PathSecurityError),
+    /// O SHA-256 calculado sobre os bytes gravados não bateu com
+    /// o valor declarado no header `X-SHA256`. O arquivo temporário
+    /// foi removido antes do retorno.
     ChecksumMismatch { expected: String, actual: String },
+    /// Qualquer falha de I/O durante a escrita/leitura/rename.
     Io(std::io::Error),
+    /// Variante reservada; não é emitida pelo código atual porque
+    /// `atomic_upload` cria o `tmp_dir` sob demanda.
     TmpDirMissing(PathBuf),
 }
 
@@ -34,13 +57,46 @@ impl From<std::io::Error> for UploadError {
     }
 }
 
-/// Upload atômico: stream → arquivo temporário → validação SHA-256 → rename para destino.
+/// Grava `body` em `base_path / target_relative` com garantias
+/// atômicas.
 ///
-/// Segue RF01 da tech-spec:
-/// - Escrita em tmp_dir primeiro (nunca parcial no destino).
-/// - Validação de checksum antes de promover.
-/// - `fs::rename` atômico para o destino final.
-/// - Path traversal bloqueado por `secure_join`.
+/// Fluxo:
+///
+/// 1. `target_relative` é sanitizado e resolvido contra `base_path`
+///    via [`secure_join`] — qualquer traversal é rejeitado aqui.
+/// 2. `tmp_dir` é criado se ainda não existir
+///    (`create_dir_all`). O nome do arquivo temporário usa
+///    nanossegundos desde `UNIX_EPOCH`, suficiente para evitar
+///    colisão em uso single-process.
+/// 3. `body` é gravado integralmente no tmp e sincronizado com
+///    `sync_all` (fsync) antes de fechar.
+/// 4. O conteúdo é re-lido e passado pelo SHA-256. Se
+///    `expected_sha256` **não for vazio**, compara em lowercase.
+///    Divergência: remove o tmp e devolve
+///    [`UploadError::ChecksumMismatch`].
+/// 5. `final_path.parent()` é garantido (`create_dir_all`) e o
+///    rename atômico move o tmp para o destino.
+/// 6. Log estruturado emitido com path final, checksum e tamanho.
+///
+/// # Assumptions
+///
+/// - `tmp_dir` e `base_path` devem viver no **mesmo filesystem** —
+///   o `fs::rename` só é atômico sob essa condição. Essa premissa
+///   não é validada em runtime; é responsabilidade da configuração.
+/// - Nome de arquivo temporário não é cryptographically unique.
+///   Seguro para um daemon single-writer; se múltiplos processos
+///   compartilharem o tmp_dir, colisões ficam teoricamente possíveis.
+/// - `expected_sha256` vazio **pula a verificação** — útil em testes
+///   e uploads internos, mas em produção o cliente sempre envia.
+///
+/// # Errors
+///
+/// - [`UploadError::InvalidPath`] se `target_relative` falhar em
+///   [`secure_join`] (traversal, absoluto, etc).
+/// - [`UploadError::ChecksumMismatch`] se `expected_sha256` não
+///   estiver vazio e não bater com o conteúdo gravado.
+/// - [`UploadError::Io`] para qualquer falha de
+///   `create_dir_all`/`File::create`/`write_all`/`rename`, etc.
 pub async fn atomic_upload(
     base_path: &Path,
     tmp_dir: &Path,
