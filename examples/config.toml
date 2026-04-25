@@ -1,2 +1,33 @@
-dbaccess_path = "/totvs/bin/dbaccess"
+# ─────────────────────────────────────────────
+# erp-agent config.toml
+# ─────────────────────────────────────────────
+
+[daemon]
+listen_addr   = "0.0.0.0:9876"
+psk_token     = "CHANGE-ME-256bit-random-token"
+
+# Somente esses service IDs podem ser reiniciados via API.
+allowed_services = [
+    "totvs-appserver",
+    "totvs-dbaccess",
+    "totvs-license",
+]
+
+# Diretório base para uploads (destino final após validação).
+base_path = "/totvs"
+
+# Diretório temporário para uploads em andamento.
+tmp_dir = "/totvs/.tmp_uploads"
+
+# Tamanho máximo de upload em bytes (default: 500 MB).
+max_upload_bytes = 524288000
+
+# ─── Push client (usado com --push) ─────────
+[push]
+target_addr = "192.168.1.100:9876"
+psk_token   = "CHANGE-ME-256bit-random-token"
+
+# ─── Paths do DBAccess ──────────────────────
+[paths]
+dbaccess_path    = "/totvs/bin/dbaccess"
 dbaccessini_path = "/totvs/config/dbaccess.ini"

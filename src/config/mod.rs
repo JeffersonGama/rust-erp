@@ -1,3 +1,3 @@
 pub mod models;
 
-pub use models::{AppConfig, ConfigError};
+pub use models::{AppConfig, ConfigError, PathsConfig, PushConfig};
