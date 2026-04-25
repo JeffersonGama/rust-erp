@@ -1,3 +1,42 @@
+//! Servidor HTTP Axum — roteamento, estado compartilhado e handlers.
+//!
+//! Este módulo é a "cara" do daemon: monta o `Router`, compõe as
+//! layers de autenticação, faz o `bind` e delega as quatro rotas
+//! expostas aos handlers deste mesmo arquivo.
+//!
+//! # Rotas
+//!
+//! | Método | Path              | Autenticação | Handler             |
+//! |--------|-------------------|--------------|---------------------|
+//! | GET    | `/health`         | nenhuma      | [`handle_health`]   |
+//! | POST   | `/api/v1/upload`  | PSK          | [`handle_upload`]   |
+//! | PATCH  | `/api/v1/ini`     | PSK          | [`handle_ini_patch`]|
+//! | POST   | `/api/v1/restart` | PSK          | [`handle_restart`]  |
+//!
+//! # Composição de layers
+//!
+//! O `protected` `Router` leva, na ordem, `layer(from_fn(psk_auth))`
+//! e `layer(Extension(psk))`. Em Axum 0.7 as layers executam
+//! last-added-first, então `Extension(psk)` roda **antes** de
+//! `psk_auth` — que é o que queremos: o middleware precisa ler a
+//! extension. Inverter essa ordem quebra a autenticação
+//! silenciosamente (middleware lê string vazia e recusa tudo).
+//!
+//! # Erros e códigos HTTP
+//!
+//! Cada handler traduz variantes de erro do submódulo correspondente
+//! em status HTTP. Os códigos usados:
+//!
+//! - `400 Bad Request` — entrada malformada (header ausente,
+//!   checksum inválido, service_id fora do regex, path inválido).
+//! - `401 Unauthorized` — PSK ausente/inválido (emitido pelo
+//!   `middleware::psk_auth`, não pelos handlers).
+//! - `403 Forbidden` — service_id fora da allowlist.
+//! - `404 Not Found` — arquivo `.ini` ou seção inexistente.
+//! - `413 Payload Too Large` — upload excede `max_upload_bytes`.
+//! - `500 Internal Server Error` — erro inesperado (I/O, lock, etc).
+//! - `504 Gateway Timeout` — `systemctl restart` estourou 30s.
+
 use std::sync::Arc;
 
 use axum::{
@@ -18,13 +57,34 @@ use crate::daemon::middleware::{psk_auth, ExpectedPsk};
 use crate::daemon::restart::{self, RestartRequest};
 use crate::daemon::upload;
 
-/// Estado compartilhado do servidor.
+/// Estado compartilhado injetado em todos os handlers via `State`.
+///
+/// Só carrega a `AppConfig` atrás de um [`Arc`] para permitir
+/// `Clone` barato — o Axum clona o estado por request. A config é
+/// imutável durante a vida do processo; mudanças exigem restart.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
 }
 
-/// Inicia o servidor Axum.
+/// Inicia o servidor Axum e bloqueia até ele terminar.
+///
+/// Monta o `Router`, faz o `TcpListener::bind` em
+/// `config.daemon.listen_addr` e serve requests até o processo
+/// receber SIGTERM/SIGINT (tratamento de sinais é delegado ao
+/// runtime Tokio).
+///
+/// Consome `config` por valor e embrulha num [`Arc`] dentro de
+/// [`AppState`]; clone-a antes se precisar dela depois.
+///
+/// # Errors
+///
+/// Devolve `Box<dyn Error>` em três situações:
+///
+/// - `bind` falhou (porta em uso, sem permissão para bindar abaixo
+///   de 1024, endereço inválido).
+/// - `axum::serve` retornou erro não-recuperável durante `accept`.
+/// - Qualquer erro que o Axum propague da loop principal.
 pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
     let listen_addr = config.daemon.listen_addr;
     let psk = ExpectedPsk(config.daemon.psk_token.clone());
@@ -61,7 +121,18 @@ pub async fn run(config: AppConfig) -> Result<(), Box<dyn std::error::Error>> {
 // Handlers
 // ──────────────────────────────────────────────
 
-/// GET /health — Retorna status do daemon (sem autenticação).
+/// `GET /health` — Health-check público.
+///
+/// Rota não autenticada. Usada por load balancers, orquestradores
+/// e pelo subcomando `push health` para detectar se o daemon está
+/// de pé. Nunca falha: se o processo está atendendo, a rota
+/// responde 200.
+///
+/// Corpo da resposta:
+///
+/// ```json
+/// { "status": "ok", "version": "<CARGO_PKG_VERSION>", "uptime_hint": "..." }
+/// ```
 async fn handle_health() -> Json<Value> {
     Json(json!({
         "status": "ok",
@@ -70,11 +141,30 @@ async fn handle_health() -> Json<Value> {
     }))
 }
 
-/// POST /api/v1/upload — Upload atômico de arquivo.
+/// `POST /api/v1/upload` — Upload atômico de arquivo.
 ///
-/// Headers requeridos:
-/// - `X-Target-Path`: caminho relativo de destino (ex: "bin/appserver")
-/// - `X-SHA256`: checksum SHA-256 esperado do conteúdo
+/// O corpo da request é o conteúdo binário do arquivo; os metadados
+/// viajam em headers (não em multipart) para simplificar o parse.
+///
+/// # Headers
+///
+/// - `X-Target-Path` — **obrigatório**, caminho relativo de destino
+///   dentro de `base_path` (ex: `bin/appserver`). Strings vazias
+///   resultam em 400.
+/// - `X-SHA256` — checksum SHA-256 esperado em hex lowercase. Se
+///   vazio, [`upload::atomic_upload`] pula a verificação (útil para
+///   testes; em produção o cliente sempre envia).
+///
+/// # Códigos de resposta
+///
+/// - `200 OK` — arquivo gravado com sucesso; corpo contém o path
+///   final absoluto.
+/// - `400 Bad Request` — `X-Target-Path` ausente, `X-SHA256`
+///   divergente do conteúdo recebido, ou path com traversal.
+/// - `413 Payload Too Large` — bytes recebidos excedem
+///   `daemon.max_upload_bytes`.
+/// - `500 Internal Server Error` — qualquer falha de I/O (disco
+///   cheio, permissão negada em `tmp_dir`, rename falhou, etc).
 async fn handle_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -145,7 +235,22 @@ async fn handle_upload(
     }
 }
 
-/// PATCH /api/v1/ini — Altera uma chave em um arquivo .ini.
+/// `PATCH /api/v1/ini` — Altera uma chave de um arquivo `.ini`.
+///
+/// Aceita JSON no formato [`PatchIniRequest`] (section/key/value).
+/// Sempre opera sobre `paths.dbaccessini_path` da config — o campo
+/// `target_file` do payload é **ignorado** neste endpoint (ver
+/// nota em [`ini_patcher::patch_dbaccess_ini_file`]).
+///
+/// # Códigos de resposta
+///
+/// - `200 OK` — patch aplicado; corpo inclui `checksum_before`,
+///   `checksum_after`, `changed` e `path` (para auditoria).
+/// - `400 Bad Request` — path inválido ou com traversal.
+/// - `404 Not Found` — arquivo `.ini` não existe **ou** a seção
+///   não foi encontrada no arquivo.
+/// - `500 Internal Server Error` — falha de I/O, parse quebrado,
+///   inconsistência de checksum pós-escrita.
 async fn handle_ini_patch(
     State(state): State<AppState>,
     Json(request): Json<PatchIniRequest>,
@@ -181,7 +286,24 @@ async fn handle_ini_patch(
     }
 }
 
-/// POST /api/v1/restart — Reinicia um serviço via systemctl.
+/// `POST /api/v1/restart` — Reinicia um serviço via `systemctl`.
+///
+/// Aceita JSON no formato [`RestartRequest`] (`service_id`). O
+/// `service_id` passa por três filtros antes de chegar ao
+/// `systemctl`: regex de formato, allowlist em
+/// `daemon.allowed_services` e timeout de 30s na execução.
+///
+/// # Códigos de resposta
+///
+/// - `200 OK` — `systemctl restart` retornou sucesso; corpo ecoa
+///   `service_id`.
+/// - `400 Bad Request` — `service_id` não bate com o regex de
+///   caracteres permitidos.
+/// - `403 Forbidden` — `service_id` não está em
+///   `daemon.allowed_services`.
+/// - `500 Internal Server Error` — `systemctl` retornou código de
+///   erro, ou falhou ao spawnar.
+/// - `504 Gateway Timeout` — `systemctl` excedeu 30s.
 async fn handle_restart(
     State(state): State<AppState>,
     Json(request): Json<RestartRequest>,
