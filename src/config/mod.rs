@@ -1,12 +1,12 @@
 //! Configuração do erp-agent, carregada de `config.toml`.
 //!
-//! Reexporta os tipos públicos do submódulo [`models`]:
-//! [`AppConfig`] (root), [`ConfigError`] (falhas de I/O, parse ou
-//! validação), [`PathsConfig`] e [`PushConfig`].
-//!
-//! A seção `[daemon]` é acessada via `AppConfig::daemon` e o tipo
-//! `DaemonConfig` não é reexportado — só o binário consome diretamente.
+//! Reexporta os tipos do submódulo [`models`] consumidos fora do
+//! módulo: [`AppConfig`] (root) e [`PushConfig`]. `DaemonConfig` é
+//! acessado via `AppConfig::daemon` e `PathsConfig` via
+//! `AppConfig::paths`; a forma canônica de construí-los, quando
+//! necessário (testes, fixtures), é por
+//! `crate::config::models::PathsConfig`.
 
 pub mod models;
 
-pub use models::{AppConfig, ConfigError, PathsConfig, PushConfig};
+pub use models::{AppConfig, PushConfig};

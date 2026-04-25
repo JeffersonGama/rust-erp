@@ -20,8 +20,7 @@ use crate::daemon::security::{secure_join, PathSecurityError};
 /// Falhas possíveis durante um upload atômico.
 ///
 /// `InvalidPath` e `ChecksumMismatch` indicam problema na request
-/// (cliente vira 400). `Io` e `TmpDirMissing` são erros
-/// infraestruturais (viram 500 no handler).
+/// (cliente vira 400). `Io` é erro infraestrutural (vira 500 no handler).
 #[derive(Debug)]
 pub enum UploadError {
     /// `target_relative` violou as regras de [`secure_join`]
@@ -33,9 +32,6 @@ pub enum UploadError {
     ChecksumMismatch { expected: String, actual: String },
     /// Qualquer falha de I/O durante a escrita/leitura/rename.
     Io(std::io::Error),
-    /// Variante reservada; não é emitida pelo código atual porque
-    /// `atomic_upload` cria o `tmp_dir` sob demanda.
-    TmpDirMissing(PathBuf),
 }
 
 impl std::fmt::Display for UploadError {
@@ -46,7 +42,6 @@ impl std::fmt::Display for UploadError {
                 write!(f, "SHA-256 mismatch: expected={expected}, actual={actual}")
             }
             Self::Io(e) => write!(f, "I/O error: {e}"),
-            Self::TmpDirMissing(p) => write!(f, "tmp_dir does not exist: {}", p.display()),
         }
     }
 }

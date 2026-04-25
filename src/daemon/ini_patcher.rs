@@ -1,19 +1,14 @@
 //! Patch estrutural de arquivos `.ini` com lock exclusivo e
 //! auditoria por double-checksum.
 //!
-//! Duas entradas públicas:
+//! Entrada pública: [`patch_dbaccess_ini_file`] — usada pelo
+//! handler HTTP. Lê o path do `.ini` direto de
+//! `config.paths.dbaccessini_path` e **ignora** o campo
+//! `target_file` do payload (ver `NOTE` no item).
 //!
-//! - [`patch_dbaccess_ini_file`] — usada pelo handler HTTP. Lê o
-//!   path do `.ini` direto de `config.paths.dbaccessini_path` e
-//!   **ignora** o campo `target_file` do payload (ver `NOTE` no
-//!   item).
-//! - [`patch_ini_file`] — variante que resolve o path a partir de
-//!   `base_path` + `request.target_file`. Não é chamada pelo
-//!   server atualmente; fica disponível para testes e usos futuros.
-//!
-//! Ambas delegam para o mesmo core privado que: (1) adquire lock
-//! exclusivo via `fs3::FileExt::lock_exclusive`, (2) lê o conteúdo
-//! e calcula `checksum_before`, (3) edita a estrutura com `rust-ini`
+//! Internamente: (1) adquire lock exclusivo via
+//! `fs3::FileExt::lock_exclusive`, (2) lê o conteúdo e calcula
+//! `checksum_before`, (3) edita a estrutura com `rust-ini`
 //! (preserva comentários e ordem), (4) calcula `checksum_after` a
 //! partir do buffer renderizado, (5) regrava o arquivo truncando
 //! primeiro, (6) libera o lock. O par de checksums serve como
@@ -42,18 +37,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::config::AppConfig;
-use crate::daemon::security::{sanitize_relative_path, secure_join, PathSecurityError};
+use crate::daemon::security::{sanitize_relative_path, PathSecurityError};
 
 /// Payload JSON aceito por `PATCH /api/v1/ini`.
 ///
 /// O campo `target_file` vem do protocolo mas é **ignorado** pelo
-/// endpoint HTTP — ver nota em [`patch_dbaccess_ini_file`]. Ele é
-/// usado apenas por [`patch_ini_file`].
+/// endpoint HTTP — ver nota em [`patch_dbaccess_ini_file`].
 #[derive(Debug, Deserialize)]
 pub struct PatchIniRequest {
-    /// Caminho relativo do `.ini` dentro de `base_path`. Ignorado
-    /// por [`patch_dbaccess_ini_file`]; consumido por
-    /// [`patch_ini_file`].
+    // Mantido para compatibilidade do contrato HTTP — ignorado pelo
+    // server, que sempre usa `paths.dbaccessini_path` da config.
+    #[allow(dead_code)]
     pub target_file: String,
     /// Nome da seção (sem os colchetes) — ex: `"Postgres"`.
     pub section: String,
@@ -85,13 +79,9 @@ pub struct PatchIniResult {
     pub checksum_after: String,
 }
 
-/// Falhas possíveis em [`patch_dbaccess_ini_file`] /
-/// [`patch_ini_file`].
+/// Falhas possíveis em [`patch_dbaccess_ini_file`].
 #[derive(Debug)]
 pub enum IniPatchError {
-    /// `request.target_file` violou [`secure_join`] em
-    /// [`patch_ini_file`].
-    InvalidPath(PathSecurityError),
     /// Arquivo alvo não existe ou não é um arquivo regular.
     FileNotFound(PathBuf),
     /// Falha de I/O (abertura, leitura, lock, write, truncate).
@@ -102,15 +92,13 @@ pub enum IniPatchError {
     /// Seção informada não existe no arquivo.
     MissingSection(String),
     /// `paths.dbaccessini_path` da config é relativo **e** falhou
-    /// em [`sanitize_relative_path`] (ex: `../foo.ini`). Só é
-    /// emitido por [`patch_dbaccess_ini_file`].
+    /// em [`sanitize_relative_path`] (ex: `../foo.ini`).
     InvalidConfiguredPath(PathSecurityError),
 }
 
 impl std::fmt::Display for IniPatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidPath(e) => write!(f, "invalid path: {e:?}"),
             Self::FileNotFound(p) => write!(f, "file not found: {}", p.display()),
             Self::Io(e) => write!(f, "I/O error: {e}"),
             Self::Parse(e) => write!(f, "INI parse error: {e}"),
@@ -145,9 +133,8 @@ impl From<ini::ParseError> for IniPatchError {
 ///
 /// **`request.target_file` é ignorado por esta função.** O path é
 /// determinado exclusivamente pela config — é o comportamento que
-/// o handler HTTP expõe hoje. Se precisar decidir o alvo com base
-/// no payload, use [`patch_ini_file`]. Esse contraponto está na
-/// pauta para revisão (ver `CLAUDE.md`).
+/// o handler HTTP expõe hoje. O campo segue no contrato HTTP por
+/// decisão registrada em `CLAUDE.md` (revisão futura do protocolo).
 ///
 /// # Errors
 ///
@@ -201,34 +188,6 @@ fn patch_ini_at_path(
         (Ok(_), Err(err)) => Err(IniPatchError::Io(err)),
         (Err(original_err), Err(_unlock_err)) => Err(original_err),
     }
-}
-
-/// Aplica `request` ao `.ini` resolvido como
-/// `base_path` + `request.target_file`.
-///
-/// Usa [`secure_join`] para proteger contra traversal — o path
-/// final precisa ficar dentro de `base_path`. Diferente de
-/// [`patch_dbaccess_ini_file`], esta função **honra**
-/// `request.target_file` e é a forma recomendada se o alvo vier
-/// da request.
-///
-/// Hoje não é chamada pelo handler HTTP; existe para testes e
-/// para possível exposição futura de uma rota mais flexível.
-///
-/// # Errors
-///
-/// - [`IniPatchError::InvalidPath`] se `request.target_file`
-///   falhar em [`secure_join`] (traversal, absoluto, etc).
-/// - [`IniPatchError::FileNotFound`] / `Io` / `Parse` /
-///   `MissingSection` nas mesmas condições que
-///   [`patch_dbaccess_ini_file`].
-pub fn patch_ini_file(
-    base_path: &Path,
-    request: &PatchIniRequest,
-) -> Result<PatchIniResult, IniPatchError> {
-    let target_path =
-        secure_join(base_path, &request.target_file).map_err(IniPatchError::InvalidPath)?;
-    patch_ini_at_path(&target_path, request)
 }
 
 fn patch_locked_file(
@@ -310,12 +269,27 @@ mod tests {
         path
     }
 
+    fn config_for(ini_path: &Path) -> AppConfig {
+        AppConfig {
+            daemon: Default::default(),
+            push: None,
+            paths: crate::config::models::PathsConfig {
+                dbaccess_path: ini_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("/"))
+                    .join("bin/dbaccess"),
+                dbaccessini_path: ini_path.to_path_buf(),
+            },
+        }
+    }
+
     #[test]
     fn patch_is_idempotent_when_value_is_already_set() {
         let base = temp_dir();
         let ini_path = base.join("dbaccess.ini");
         fs::write(&ini_path, "[Postgres]\nThread=40\nPassword=secret\n").unwrap();
 
+        let config = config_for(&ini_path);
         let request = PatchIniRequest {
             target_file: "dbaccess.ini".into(),
             section: "Postgres".into(),
@@ -324,7 +298,7 @@ mod tests {
         };
 
         let before = fs::read_to_string(&ini_path).unwrap();
-        let result = patch_ini_file(&base, &request).unwrap();
+        let result = patch_dbaccess_ini_file(&config, &request).unwrap();
         let after = fs::read_to_string(&ini_path).unwrap();
 
         assert!(!result.changed);
@@ -337,6 +311,7 @@ mod tests {
         let ini_path = base.join("dbaccess.ini");
         fs::write(&ini_path, "[Postgres]\nThread=10\nPassword=encrypted\n").unwrap();
 
+        let config = config_for(&ini_path);
         let request = PatchIniRequest {
             target_file: "dbaccess.ini".into(),
             section: "Postgres".into(),
@@ -344,7 +319,7 @@ mod tests {
             new_value: "40".into(),
         };
 
-        let result = patch_ini_file(&base, &request).unwrap();
+        let result = patch_dbaccess_ini_file(&config, &request).unwrap();
         let after = fs::read_to_string(&ini_path).unwrap();
 
         assert!(result.changed);
@@ -366,7 +341,7 @@ mod tests {
         let config = AppConfig {
             daemon: Default::default(),
             push: None,
-            paths: crate::config::PathsConfig {
+            paths: crate::config::models::PathsConfig {
                 dbaccess_path: base.join("bin/dbaccess"),
                 dbaccessini_path: ini_path.clone(),
             },
@@ -392,7 +367,7 @@ mod tests {
         let config = AppConfig {
             daemon: Default::default(),
             push: None,
-            paths: crate::config::PathsConfig {
+            paths: crate::config::models::PathsConfig {
                 dbaccess_path: PathBuf::from("/totvs/bin/dbaccess"),
                 dbaccessini_path: PathBuf::from("../dbaccess.ini"),
             },

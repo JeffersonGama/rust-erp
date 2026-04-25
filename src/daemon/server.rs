@@ -272,10 +272,6 @@ async fn handle_ini_patch(
             StatusCode::NOT_FOUND,
             Json(json!({"error": format!("section not found: [{s}]")})),
         )),
-        Err(ini_patcher::IniPatchError::InvalidPath(_)) => Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "invalid path (possible traversal)"})),
-        )),
         Err(e) => {
             tracing::error!(error = %e, "ini patch failed");
             Err((
