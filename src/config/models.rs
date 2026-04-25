@@ -19,6 +19,13 @@ pub struct AppConfig {
     pub paths: PathsConfig,
 }
 
+/// Configuração do modo daemon — só é exigida quando o subcomando
+/// `daemon` é executado. Em modo `push`, esta seção pode estar
+/// ausente ou preenchida com valores default.
+///
+/// Os campos `psk_token`, `base_path` e `tmp_dir` **não** têm default
+/// explícito no TOML: se ausentes, falham no parse. Os demais caem
+/// nos defaults definidos em [`Default::default`].
 #[derive(Debug, Deserialize, Clone)]
 pub struct DaemonConfig {
     /// Endereço de escuta do servidor HTTP.
@@ -64,6 +71,13 @@ impl Default for DaemonConfig {
     }
 }
 
+/// Configuração do modo push — cliente HTTP que fala com um daemon
+/// remoto. Só é consumida pelo subcomando `push`; o modo daemon
+/// ignora esta seção.
+///
+/// Marcada como `Option<PushConfig>` em [`AppConfig`] porque um host
+/// que só roda como daemon não precisa preencher — `main.rs` aborta
+/// com mensagem clara se `push` for invocado sem `[push]` no TOML.
 #[derive(Debug, Deserialize, Clone)]
 pub struct PushConfig {
     /// Endereço do daemon remoto (ex: "192.168.1.100:9876").
@@ -73,6 +87,14 @@ pub struct PushConfig {
     pub psk_token: String,
 }
 
+/// Paths do DBAccess na máquina Protheus. Consumidos principalmente
+/// pelo `ini_patcher` (via `dbaccessini_path`); o `dbaccess_path`
+/// fica reservado para uso futuro (ex: validação de integridade do
+/// binário após upload).
+///
+/// Pode ser absoluto (recomendado — `/totvs/config/dbaccess.ini`) ou
+/// relativo; paths relativos são sanitizados contra traversal antes
+/// do uso (ver `daemon::ini_patcher::patch_dbaccess_ini_file`).
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct PathsConfig {
     /// Caminho do binário do DBAccess.
@@ -82,13 +104,32 @@ pub struct PathsConfig {
     pub dbaccessini_path: PathBuf,
 }
 
+/// Erros possíveis ao carregar ou validar um [`AppConfig`].
+///
+/// As variantes `Io` e `ParseToml` podem surgir em qualquer modo;
+/// as demais (`MissingDbAccessBinaryPath`, `MissingDbAccessIniPath`,
+/// `EmptyPskToken`, `NoAllowedServices`) só são produzidas por
+/// [`AppConfig::validate_daemon`] e, portanto, só afetam o modo daemon.
 #[derive(Debug)]
 pub enum ConfigError {
+    /// Falha lendo o arquivo de configuração (não existe, sem
+    /// permissão, etc). Encapsula o [`std::io::Error`] original.
     Io(std::io::Error),
+    /// `config.toml` malformado — sintaxe inválida, seção obrigatória
+    /// ausente (ex: `[paths]`) ou tipo de campo incompatível.
     ParseToml(toml::de::Error),
+    /// `paths.dbaccess_path` está vazio — disparado por
+    /// [`AppConfig::validate_daemon`].
     MissingDbAccessBinaryPath,
+    /// `paths.dbaccessini_path` está vazio — disparado por
+    /// [`AppConfig::validate_daemon`].
     MissingDbAccessIniPath,
+    /// `daemon.psk_token` está vazio — autenticação PSK não pode
+    /// funcionar sem token, então o daemon se recusa a iniciar.
     EmptyPskToken,
+    /// `daemon.allowed_services` está vazio — nenhum serviço poderia
+    /// ser reiniciado via `/api/v1/restart`, então o daemon trata
+    /// como misconfig.
     NoAllowedServices,
 }
 
@@ -118,17 +159,48 @@ impl From<toml::de::Error> for ConfigError {
 }
 
 impl AppConfig {
+    /// Desserializa uma string TOML em um `AppConfig`.
+    ///
+    /// Não valida conteúdo — apenas forma. Use
+    /// [`AppConfig::validate_daemon`] antes de iniciar o modo daemon.
+    ///
+    /// # Errors
+    ///
+    /// Retorna [`ConfigError::ParseToml`] se o TOML for inválido
+    /// ou se seções obrigatórias (como `[paths]`) estiverem ausentes.
     pub fn from_str(contents: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(contents)?;
         Ok(config)
     }
 
+    /// Carrega e desserializa um `config.toml` do disco.
+    ///
+    /// # Errors
+    ///
+    /// - [`ConfigError::Io`] se o arquivo não existir ou não for legível.
+    /// - [`ConfigError::ParseToml`] se o conteúdo não for TOML válido.
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let contents = fs::read_to_string(path)?;
         Self::from_str(&contents)
     }
 
-    /// Valida configuração para o modo daemon.
+    /// Valida a configuração para execução em modo daemon.
+    ///
+    /// Aplica as seguintes checagens, retornando na primeira falha:
+    ///
+    /// 1. `paths.dbaccess_path` não vazio.
+    /// 2. `paths.dbaccessini_path` não vazio.
+    /// 3. `daemon.psk_token` não vazio (autenticação obrigatória).
+    /// 4. `daemon.allowed_services` não vazio (senão o endpoint
+    ///    `/api/v1/restart` seria inútil).
+    ///
+    /// O modo `push` **não** exige essa validação — só lê a seção
+    /// `[push]`, que é opcional.
+    ///
+    /// # Errors
+    ///
+    /// Retorna a variante de [`ConfigError`] correspondente ao
+    /// primeiro campo ausente/vazio. Não acumula todas as falhas.
     pub fn validate_daemon(&self) -> Result<(), ConfigError> {
         if self.paths.dbaccess_path.as_os_str().is_empty() {
             return Err(ConfigError::MissingDbAccessBinaryPath);

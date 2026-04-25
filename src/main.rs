@@ -1,3 +1,35 @@
+//! # erp-agent
+//!
+//! Orquestrador CLI/daemon para administração remota de servidores
+//! Totvs Protheus on-premise. Não é um ERP nem um parser SQL: é um
+//! agente que roda nas máquinas Protheus para permitir operações
+//! automatizadas e auditáveis disparadas de um host central.
+//!
+//! ## Modos de operação
+//!
+//! O binário expõe dois subcomandos mutuamente exclusivos via Clap:
+//!
+//! - `daemon` — sobe um servidor HTTP Axum na máquina Protheus e
+//!   aceita comandos autenticados por PSK (ver módulo `daemon::server`).
+//! - `push` — cliente CLI que envia comandos a um daemon remoto:
+//!   `upload`, `ini`, `restart`, `health` (ver módulo `push::client`).
+//!
+//! Ambos os modos compartilham o mesmo `config.toml`. O modo daemon
+//! ainda exige `AppConfig::validate_daemon` no bootstrap — PSK vazio
+//! ou allowlist de serviços vazia abortam o start.
+//!
+//! ## Uso
+//!
+//! ```bash
+//! erp-agent --config config.toml daemon
+//! erp-agent --config config.toml push health
+//! erp-agent --config config.toml push upload --file ./bin/appserver --target bin/appserver
+//! erp-agent --config config.toml push ini --section Postgres --key Thread --value 40
+//! erp-agent --config config.toml push restart --service totvs-appserver
+//! ```
+//!
+//! Consulte `docs/tech-spec.md` para o desenho técnico completo.
+
 mod config;
 mod daemon;
 mod push;
