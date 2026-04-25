@@ -1,3 +1,37 @@
+//! Patch estrutural de arquivos `.ini` com lock exclusivo e
+//! auditoria por double-checksum.
+//!
+//! Duas entradas públicas:
+//!
+//! - [`patch_dbaccess_ini_file`] — usada pelo handler HTTP. Lê o
+//!   path do `.ini` direto de `config.paths.dbaccessini_path` e
+//!   **ignora** o campo `target_file` do payload (ver `NOTE` no
+//!   item).
+//! - [`patch_ini_file`] — variante que resolve o path a partir de
+//!   `base_path` + `request.target_file`. Não é chamada pelo
+//!   server atualmente; fica disponível para testes e usos futuros.
+//!
+//! Ambas delegam para o mesmo core privado que: (1) adquire lock
+//! exclusivo via `fs3::FileExt::lock_exclusive`, (2) lê o conteúdo
+//! e calcula `checksum_before`, (3) edita a estrutura com `rust-ini`
+//! (preserva comentários e ordem), (4) calcula `checksum_after` a
+//! partir do buffer renderizado, (5) regrava o arquivo truncando
+//! primeiro, (6) libera o lock. O par de checksums serve como
+//! evidência em log de auditoria: o cliente pode armazenar antes/
+//! depois e reconciliar caso o arquivo seja editado fora do daemon.
+//!
+//! # Assumptions
+//!
+//! - O lock exclusivo não tem timeout. Se outro processo segurar
+//!   o arquivo, a chamada bloqueia indefinidamente. Na prática só
+//!   o daemon toca nesse arquivo durante operação normal, mas é
+//!   bom saber caso alguém mantenha o `.ini` aberto em editor
+//!   com advisory lock.
+//! - Edição estrutural com `rust-ini` preserva comentários e
+//!   formatação, mas a ordem interna das chaves dentro de uma
+//!   seção pode ser normalizada pelo parser — isso é aceitável
+//!   para o DBAccess.
+
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -10,29 +44,66 @@ use sha2::{Digest, Sha256};
 use crate::config::AppConfig;
 use crate::daemon::security::{sanitize_relative_path, secure_join, PathSecurityError};
 
+/// Payload JSON aceito por `PATCH /api/v1/ini`.
+///
+/// O campo `target_file` vem do protocolo mas é **ignorado** pelo
+/// endpoint HTTP — ver nota em [`patch_dbaccess_ini_file`]. Ele é
+/// usado apenas por [`patch_ini_file`].
 #[derive(Debug, Deserialize)]
 pub struct PatchIniRequest {
+    /// Caminho relativo do `.ini` dentro de `base_path`. Ignorado
+    /// por [`patch_dbaccess_ini_file`]; consumido por
+    /// [`patch_ini_file`].
     pub target_file: String,
+    /// Nome da seção (sem os colchetes) — ex: `"Postgres"`.
     pub section: String,
+    /// Nome da chave a alterar — ex: `"Thread"`.
     pub key: String,
+    /// Novo valor para a chave — ex: `"40"`.
     pub new_value: String,
 }
 
+/// Resultado de um patch bem-sucedido.
+///
+/// Os dois checksums viabilizam auditoria: o cliente pode registrar
+/// o par `(checksum_before, checksum_after)` e detectar edições
+/// externas ao daemon comparando com snapshots posteriores. Se
+/// `changed` for `false`, os dois checksums são iguais e o arquivo
+/// no disco não foi tocado.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PatchIniResult {
+    /// Caminho absoluto que foi efetivamente editado.
     pub path: PathBuf,
+    /// `false` quando a chave já tinha exatamente `new_value` — a
+    /// operação é idempotente.
     pub changed: bool,
+    /// SHA-256 (hex, lowercase) do conteúdo antes do patch.
     pub checksum_before: String,
+    /// SHA-256 (hex, lowercase) do buffer renderizado que foi
+    /// gravado. Idêntico a `checksum_before` quando `changed` é
+    /// `false`.
     pub checksum_after: String,
 }
 
+/// Falhas possíveis em [`patch_dbaccess_ini_file`] /
+/// [`patch_ini_file`].
 #[derive(Debug)]
 pub enum IniPatchError {
+    /// `request.target_file` violou [`secure_join`] em
+    /// [`patch_ini_file`].
     InvalidPath(PathSecurityError),
+    /// Arquivo alvo não existe ou não é um arquivo regular.
     FileNotFound(PathBuf),
+    /// Falha de I/O (abertura, leitura, lock, write, truncate).
     Io(std::io::Error),
+    /// Conteúdo do `.ini` é sintaticamente inválido para o
+    /// `rust-ini` parser.
     Parse(ini::ParseError),
+    /// Seção informada não existe no arquivo.
     MissingSection(String),
+    /// `paths.dbaccessini_path` da config é relativo **e** falhou
+    /// em [`sanitize_relative_path`] (ex: `../foo.ini`). Só é
+    /// emitido por [`patch_dbaccess_ini_file`].
     InvalidConfiguredPath(PathSecurityError),
 }
 
@@ -61,6 +132,33 @@ impl From<ini::ParseError> for IniPatchError {
     }
 }
 
+/// Aplica `request` ao `.ini` configurado em
+/// `config.paths.dbaccessini_path`.
+///
+/// Path absoluto é usado como está; path relativo passa por
+/// [`sanitize_relative_path`] (bloqueia `..`, componentes vazios,
+/// não-UTF-8). Depois o arquivo é aberto em modo RW, recebe lock
+/// exclusivo e é patchado — o lock é liberado antes do retorno,
+/// mesmo em caso de erro.
+///
+/// # NOTE
+///
+/// **`request.target_file` é ignorado por esta função.** O path é
+/// determinado exclusivamente pela config — é o comportamento que
+/// o handler HTTP expõe hoje. Se precisar decidir o alvo com base
+/// no payload, use [`patch_ini_file`]. Esse contraponto está na
+/// pauta para revisão (ver `CLAUDE.md`).
+///
+/// # Errors
+///
+/// - [`IniPatchError::InvalidConfiguredPath`] se
+///   `dbaccessini_path` for relativo e falhar na sanitização.
+/// - [`IniPatchError::FileNotFound`] se o path resolvido não
+///   apontar para um arquivo regular.
+/// - [`IniPatchError::Io`] em falha de open/lock/read/write.
+/// - [`IniPatchError::Parse`] se o `.ini` estiver malformado.
+/// - [`IniPatchError::MissingSection`] se `request.section` não
+///   existir no arquivo.
 pub fn patch_dbaccess_ini_file(
     config: &AppConfig,
     request: &PatchIniRequest,
@@ -105,6 +203,25 @@ fn patch_ini_at_path(
     }
 }
 
+/// Aplica `request` ao `.ini` resolvido como
+/// `base_path` + `request.target_file`.
+///
+/// Usa [`secure_join`] para proteger contra traversal — o path
+/// final precisa ficar dentro de `base_path`. Diferente de
+/// [`patch_dbaccess_ini_file`], esta função **honra**
+/// `request.target_file` e é a forma recomendada se o alvo vier
+/// da request.
+///
+/// Hoje não é chamada pelo handler HTTP; existe para testes e
+/// para possível exposição futura de uma rota mais flexível.
+///
+/// # Errors
+///
+/// - [`IniPatchError::InvalidPath`] se `request.target_file`
+///   falhar em [`secure_join`] (traversal, absoluto, etc).
+/// - [`IniPatchError::FileNotFound`] / `Io` / `Parse` /
+///   `MissingSection` nas mesmas condições que
+///   [`patch_dbaccess_ini_file`].
 pub fn patch_ini_file(
     base_path: &Path,
     request: &PatchIniRequest,
@@ -168,6 +285,9 @@ fn persist_locked_file(file: &mut File, rendered: &[u8]) -> Result<(), IniPatchE
     Ok(())
 }
 
+/// SHA-256 em hex lowercase — utilitário público por ora
+/// duplicado em `daemon::upload` e `push::client`. Ver débitos
+/// registrados em `CLAUDE.md`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
