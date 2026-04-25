@@ -1,4 +1,4 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -31,9 +31,22 @@ pub enum IniPatchError {
     InvalidPath(PathSecurityError),
     FileNotFound(PathBuf),
     Io(std::io::Error),
-    Parse(ini::Error),
+    Parse(ini::ParseError),
     MissingSection(String),
     InvalidConfiguredPath(PathSecurityError),
+}
+
+impl std::fmt::Display for IniPatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidPath(e) => write!(f, "invalid path: {e:?}"),
+            Self::FileNotFound(p) => write!(f, "file not found: {}", p.display()),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Parse(e) => write!(f, "INI parse error: {e}"),
+            Self::MissingSection(s) => write!(f, "section not found: [{s}]"),
+            Self::InvalidConfiguredPath(e) => write!(f, "invalid configured path: {e:?}"),
+        }
+    }
 }
 
 impl From<std::io::Error> for IniPatchError {
@@ -42,8 +55,8 @@ impl From<std::io::Error> for IniPatchError {
     }
 }
 
-impl From<ini::Error> for IniPatchError {
-    fn from(value: ini::Error) -> Self {
+impl From<ini::ParseError> for IniPatchError {
+    fn from(value: ini::ParseError) -> Self {
         Self::Parse(value)
     }
 }
@@ -57,7 +70,7 @@ pub fn patch_dbaccess_ini_file(
 }
 
 fn configured_dbaccess_ini_path(config: &AppConfig) -> Result<PathBuf, IniPatchError> {
-    let configured_path = &config.dbaccessini_path;
+    let configured_path = &config.paths.dbaccessini_path;
 
     if configured_path.is_absolute() {
         return Ok(configured_path.clone());
@@ -155,7 +168,7 @@ fn persist_locked_file(file: &mut File, rendered: &[u8]) -> Result<(), IniPatchE
     Ok(())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
@@ -164,6 +177,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
@@ -225,16 +239,17 @@ mod tests {
         fs::create_dir_all(ini_path.parent().unwrap()).unwrap();
         fs::write(
             &ini_path,
-            "[Postgres]
-Thread=10
-Password=encrypted
-",
+            "[Postgres]\nThread=10\nPassword=encrypted\n",
         )
         .unwrap();
 
         let config = AppConfig {
-            dbaccess_path: base.join("bin/dbaccess"),
-            dbaccessini_path: ini_path.clone(),
+            daemon: Default::default(),
+            push: None,
+            paths: crate::config::PathsConfig {
+                dbaccess_path: base.join("bin/dbaccess"),
+                dbaccessini_path: ini_path.clone(),
+            },
         };
 
         let request = PatchIniRequest {
@@ -255,8 +270,12 @@ Password=encrypted
     #[test]
     fn patch_rejects_invalid_relative_path_from_config() {
         let config = AppConfig {
-            dbaccess_path: PathBuf::from("/totvs/bin/dbaccess"),
-            dbaccessini_path: PathBuf::from("../dbaccess.ini"),
+            daemon: Default::default(),
+            push: None,
+            paths: crate::config::PathsConfig {
+                dbaccess_path: PathBuf::from("/totvs/bin/dbaccess"),
+                dbaccessini_path: PathBuf::from("../dbaccess.ini"),
+            },
         };
 
         let request = PatchIniRequest {
